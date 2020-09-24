@@ -47,7 +47,7 @@ def exif_size(img):
 
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8):
+                      rank=-1, world_size=1, workers=8, patch_size=None):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache.
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
@@ -58,7 +58,8 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                                       single_cls=opt.single_cls,
                                       stride=int(stride),
                                       pad=pad,
-                                      rank=rank)
+                                      rank=rank,
+                                      patch_size=patch_size)
 
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
@@ -327,7 +328,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0, rank=-1):
+                 cache_images=False, single_cls=False, stride=32, pad=0.0, rank=-1, patch_size=None):
         try:
             f = []  # image files
             for p in path if isinstance(path, list) else [path]:
@@ -354,6 +355,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.n = n  # number of images
         self.batch = bi  # batch index of image
         self.img_size = img_size
+        self.patch_size = patch_size
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
@@ -565,7 +567,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             # Apply cutouts
             # if random.random() < 0.9:
             #     labels = cutout(img, labels)
-
+        if self.patch_size:
+            img, labels = random_patch(img, labels, self.patch_size)
         nL = len(labels)  # number of labels
         if nL:
             labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])  # convert xyxy to xywh
@@ -834,6 +837,28 @@ def random_perspective(img, targets=(), degrees=10, translate=.1, scale=.1, shea
 
     return img, targets
 
+def random_patch(img, labels, patch_size):
+    patch_size = patch_size[0]
+    img_w, img_h = img.shape[:2]
+    # select random patch
+    patch_x, patch_y = random.randint(0, img_w - patch_size), random.randint(0, img_h - patch_size)
+    patch = img[patch_y:patch_y + patch_size, patch_x:patch_x + patch_size]
+
+    # adjust labels to patch size
+    labels[:, 1] -= patch_x
+    labels[:, 2] -= patch_y
+    labels[:, 3] -= patch_x
+    labels[:, 4] -= patch_y
+
+    # remove bounding boxes outside patch
+    p1_inside = (labels[:, 1] > 0) & (labels[:, 1] < patch_size) & (labels[:, 2] > 0) & (labels[:, 2] < patch_size)
+    p2_inside = (labels[:, 3] > 0) & (labels[:, 3] < patch_size) & (labels[:, 4] > 0) & (labels[:, 4] < patch_size)
+    labels = labels[np.logical_or(p1_inside, p2_inside)]
+    # adjust labels outside patch
+    labels[labels < 0] = 0
+    labels[labels > patch_size] = patch_size
+
+    return patch, labels
 
 def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1):  # box1(4,n), box2(4,n)
     # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio
